@@ -4,7 +4,7 @@
 기존 IM 변환기와 같은 방식으로 한 화면에 하나씩:
   1 원본 업로드  →  2 하이라이트  →  3 내용  →  4 생성
 """
-import os, sys, tempfile
+import os, sys, io, re, contextlib, tempfile
 import streamlit as st
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -130,6 +130,8 @@ if step == 1:
                     st.session_state[f"hb_{_i}"] = "\n".join(hl[_i].get("bullets") or [])
                     st.session_state[f"hu_{_i}"] = bool(_sub)
                 st.session_state.pop("hl_prev", None)
+                st.session_state.pop("fname", None)      # 파일명도 새 딜 이름으로
+                st.session_state.pop("build_log", None)
             except Exception as e:
                 import traceback
                 st.error(f"추출 실패: {e}")
@@ -503,6 +505,16 @@ elif step == 4:
     else:
         st.write(f"**{data.get('deal_name','')}**  ·  {data.get('date_ko','')}  ·  "
                  f"핵심요약 {st.session_state.get('pages', 1)}페이지")
+
+        # ── 파일명 ────────────────────────────────────
+        _dflt = f"[Rainfield]_{(data.get('deal_name') or '요약본')[:40]}_요약본"
+        st.session_state.setdefault("fname", _dflt)
+        _f1, _f2 = st.columns([5, 1])
+        _f1.text_input("파일명", key="fname",
+                       help="다운로드될 파일 이름입니다. 확장자(.pptx)는 자동으로 붙습니다.")
+        _f2.markdown("<div style='padding-top:34px;color:#5b6b85;'>.pptx</div>",
+                     unsafe_allow_html=True)
+
         if st.button("생성", type="primary"):
             data["highlights"] = st.session_state.get("hl") or []
             # 3단계에서 정한 칸 배치 → 빌더가 이 순서대로 쌓는다('(비움)' 은 제외)
@@ -521,8 +533,14 @@ elif step == 4:
                     tf = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
                     tf.write(st.session_state["_pdf_bytes"]); tf.close()
                     out = tempfile.NamedTemporaryFile(suffix=".pptx", delete=False).name
-                    build_summary(data, tf.name, out,
-                                  pages=st.session_state.get("pages", 1))
+                    # 빌더가 내보내는 넘침·축소 안내를 받아 화면에도 보여준다.
+                    _log = io.StringIO()
+                    with contextlib.redirect_stdout(_log):
+                        build_summary(data, tf.name, out,
+                                      pages=st.session_state.get("pages", 1))
+                    st.session_state["build_log"] = [
+                        ln for ln in _log.getvalue().splitlines()
+                        if "[요약본]" in ln]
                     with open(out, "rb") as f:
                         st.session_state["ppt"] = f.read()
                 except Exception as e:
@@ -534,12 +552,20 @@ elif step == 4:
         # ★다운로드 버튼은 생성 블록 '바깥'에서 세션 값으로 그린다.
         #   버튼을 누르면 Streamlit 이 페이지를 다시 그리는데, 결과가 블록 안
         #   지역변수면 그때 사라져서 다시 생성해야 하는 문제가 생긴다.
+        for _ln in (st.session_state.get("build_log") or []):
+            (st.warning if "경고" in _ln else st.info)(_ln.replace("[요약본] ", ""))
+
         if st.session_state.get("ppt"):
             st.success("생성 완료")
-            _nm = (data.get("deal_name") or "요약본")[:40]
+            # 윈도 파일명에 못 쓰는 글자(\ / : * ? " < > |)는 걸러낸다.
+            _nm = re.sub(r'[\\/:*?"<>|]', "_",
+                         (st.session_state.get("fname") or "").strip())
+            _nm = (_nm or _dflt)[:80]
+            if _nm.lower().endswith(".pptx"):
+                _nm = _nm[:-5]
             st.download_button(
                 "다운로드", data=st.session_state["ppt"],
-                file_name=f"[Rainfield]_{_nm}_요약본.pptx",
+                file_name=f"{_nm}.pptx",
                 mime="application/vnd.openxmlformats-officedocument."
                      "presentationml.presentation",
                 type="primary", key="dl")
