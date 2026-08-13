@@ -32,7 +32,7 @@ if not os.environ.get("ANTHROPIC_API_KEY"):
 
 from pptx import Presentation
 from pptx.util import Inches
-from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE
+from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE, MSO_ANCHOR
 from extractors import extract_from_pdf
 import claude_api as _claude_api
 from claude_api import call_claude
@@ -82,14 +82,24 @@ SYS = """당신은 부동산 금융 IM(투자설명서)을 읽고 '요약본 제
  "중요항목": [{"제목":..,"내용":["..",".."]}],
  "이미지_있음": {"금융구조도": false, "조감도": true, "위치도": false}
 }
-사업일정은 핵심 마일스톤만(완료+예정 합쳐 6~8개 이내). JSON 외 다른 말 금지."""
+사업일정은 핵심 마일스톤만(완료+예정 합쳐 6~8개 이내).
+
+★"중요항목" — 위 고정 항목에 안 들어가는 원문 내용을 **여기에 빠짐없이** 담는다.
+  요약본에 넣을지는 사용자가 나중에 고르므로, 쓸 만한 건 일단 다 넣어라.
+  (예: 분양·임대 현황, 인근 시세, 시공사 개요, 신용보강·안전장치, 자금수지,
+   토지 확보 현황, 사업비·수지 분석, 조합원 현황, 임차인 현황, 감정평가 결과 등)
+  - "제목"은 원문의 표·문단 제목을 그대로 쓴다(예: '인근 아파트 시세').
+  - "내용"의 각 줄은 원문의 표를 옮길 때 "항목 : 값" 형태로 쓰고,
+    표가 아닌 설명이면 문장 한 줄로 쓴다.
+  - 항목 최대 10개, 한 항목의 내용은 최대 12줄.
+JSON 외 다른 말 금지."""
 
 
 def extract_summary(pdf_bytes: bytes) -> dict:
     data = extract_from_pdf(pdf_bytes)
     full = "\n".join(data.get("pages_text", []))
     res = call_claude(SYS, f"[IM 원문]\n{full}", slide_num=801,
-                      pdf_context=full, prompt_version="summary_extract_v2")
+                      pdf_context=full, prompt_version="summary_extract_v3")
     if not res.get("ok"):
         raise RuntimeError(res.get("error") or "추출 실패")
     return res["data"]
@@ -169,6 +179,174 @@ def _dup_slide_after(prs, src, after_idx):
     return dst
 
 
+def _clone_at_end(slide, proto):
+    """도형을 복제해 같은 슬라이드 맨 뒤에 붙인다(표·글상자 전용).
+       그림은 관계(rel)까지 따라가야 하므로 이 함수로 복제하지 않는다."""
+    slide.shapes._spTree.append(deepcopy(proto._element))
+    return slide.shapes[-1]
+
+
+def extra_blocks_of(data: dict):
+    """원본에서 찾은 '그 밖의 내용'을 [(제목, [(왼칸, 오른칸), ...]), ...] 로 만든다.
+
+    고정 항목(사모사채개요·담보대출조건·사업일정·법인개요·재무제표)에 안 들어가는
+    것도 요약본에 넣을 수 있어야 한다 → 표 한 벌로 그릴 수 있게 정리해 둔다.
+    왼칸이 빈 줄은 두 칸을 합쳐 한 줄로 그린다(표가 아닌 설명 문장).
+    """
+    out = []
+
+    ov = data.get("사업개요") or {}
+    if isinstance(ov, dict):
+        pairs = [(k, v) for k, v in ov.items() if v]
+        if pairs:
+            out.append(("사업개요", pairs))
+
+    eq = data.get("투입에쿼티") or []
+    if isinstance(eq, list) and eq:
+        pairs = []
+        for it in eq:
+            if not isinstance(it, dict):
+                continue
+            rhs = " · ".join(str(x) for x in (it.get("금액"), it.get("비고")) if x)
+            if it.get("주체") or rhs:
+                pairs.append((it.get("주체") or "", rhs))
+        if pairs:
+            out.append(("투입 에쿼티", pairs))
+
+    for it in (data.get("중요항목") or []):
+        if not isinstance(it, dict):
+            continue
+        title = str(it.get("제목") or "").strip()
+        lines = [str(x).strip() for x in (it.get("내용") or []) if str(x).strip()]
+        if not title or not lines:
+            continue
+        pairs = []
+        for ln in lines:
+            # "항목 : 값" 이면 두 칸으로, 아니면 한 줄 통으로.
+            k, sep, v = ln.partition(":")
+            if not sep:
+                k, sep, v = ln.partition("：")
+            if sep and 0 < len(k.strip()) <= 14 and v.strip():
+                pairs.append((k.strip(), v.strip()))
+            else:
+                pairs.append(("", ln))
+        out.append((title, pairs))
+
+    # 제목이 겹치면 뒤엣것에 번호를 붙여 칸 이름이 헷갈리지 않게 한다.
+    seen, uniq = {}, []
+    for title, pairs in out:
+        n = seen.get(title, 0) + 1
+        seen[title] = n
+        uniq.append((title if n == 1 else f"{title} ({n})", pairs))
+    return uniq
+
+
+def _build_extra_block(slide, proto_tbl, proto_lbl, title, pairs):
+    """[라벨 + 2열 표] 한 벌을 새로 만들어 붙인다. 반환 (라벨, 표)."""
+    lb = None
+    if proto_lbl is not None:
+        lb = _clone_at_end(slide, proto_lbl)
+        _replace_text_keep_runs(lb.text_frame, title)
+    tb = _clone_at_end(slide, proto_tbl)
+    t = tb.table
+    need, cur = max(1, len(pairs)), len(t.rows)
+    if need > cur:
+        _add_rows(t, need - cur)
+    elif need < cur:
+        _del_rows(t, cur - need)
+    for i, (a, b) in enumerate(pairs):
+        if str(a).strip():
+            _set(t, i, 0, a)
+            _set(t, i, 1, b)
+        else:
+            # 왼칸이 없으면 두 칸을 합쳐 한 줄로(설명 문장).
+            try:
+                t.cell(i, 0).merge(t.cell(i, 1))
+            except Exception:
+                pass
+            _set(t, i, 0, b)
+    # 틀에서 물려받은 세로 정렬이 칸마다 달라 글이 바닥에 붙는다 → 가운데로 통일.
+    for row in t.rows:
+        for cell in row.cells:
+            try:
+                cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+            except Exception:
+                pass
+    return lb, tb
+
+
+def _units(s: str) -> float:
+    """글자 폭을 em 단위로 센다. 한글·한자는 전각(1.0), 숫자·영문·기호는 반각(0.55)."""
+    u = 0.0
+    for ch in str(s):
+        if ('가' <= ch <= '힣' or '㄰' <= ch <= '㆏'
+                or '一' <= ch <= '鿿' or ch in '·／…‘’“”'):
+            u += 1.0
+        elif ch == ' ':
+            u += 0.30
+        else:
+            u += 0.55
+    return u
+
+
+def _set_table_width(shape, target_w: int):
+    """표를 실제로 target_w 폭에 맞춘다.
+
+    ★graphicFrame 의 width 만 바꾸면 **열 너비(gridCol)는 그대로**라
+      파워포인트는 원래 폭으로 그린다 — 표가 칸 밖으로 삐져나오거나 덜 차서
+      좌·우 단의 표들이 서로 안 맞아 보이던 원인. 열 너비를 비율대로 함께 늘린다.
+    """
+    try:
+        cols = list(shape.table.columns)
+        cur = sum(c.width or 0 for c in cols)
+    except Exception:
+        shape.width = target_w
+        return
+    if cur <= 0 or not cols:
+        shape.width = target_w
+        return
+    scaled = [int((c.width or 0) * target_w / cur) for c in cols]
+    scaled[-1] += target_w - sum(scaled)      # 반올림 오차는 마지막 열이 흡수
+    for c, w in zip(cols, scaled):
+        if w > 0:
+            c.width = w
+    shape.width = target_w
+
+
+def _fit_table_rows(shape):
+    """행 높이를 글 양에 맞춘다.
+
+    ★칸의 글이 길면 파워포인트가 행을 알아서 늘리는데, 우리가 계산한 높이는
+      늘기 전 값이라 아래 블록을 덮었다. 열 너비 기준으로 줄 수를 미리 세어 둔다.
+    """
+    try:
+        t = shape.table
+        widths = [(c.width or 0) / 914400.0 for c in t.columns]
+    except Exception:
+        return
+    for row in t.rows:
+        need = 0.0
+        for ci, cell in enumerate(row.cells):
+            w = widths[ci] if ci < len(widths) else 1.0
+            pt = 9.0
+            for p in cell.text_frame.paragraphs:
+                got = False
+                for run in p.runs:
+                    if run.font.size:
+                        pt, got = run.font.size.pt, True
+                        break
+                if got:
+                    break
+            cpl = max(1.0, (w - 0.16) * 72.0 / pt)      # 좌우 여백 0.08in 씩
+            lines = 0
+            for ln in (cell.text or "").split("\n"):
+                lines += max(1, int(-(-_units(ln) // cpl)))
+            need = max(need, max(1, lines) * pt * 1.32 / 72.0 + 0.08)
+        # ★'기존 높이와 큰 값'이 아니라 **필요한 만큼**으로 맞춘다.
+        #   틀에서 물려받은 큰 행 높이를 그대로 두면 한 줄짜리 칸이 뻥 비어 보인다.
+        row.height = int(Inches(max(0.22, need)))
+
+
 def _table_h(shape):
     """표의 실제 높이(행 높이 합)."""
     try:
@@ -192,8 +370,14 @@ def _stack(blocks, x_in, w_in, top_in, bottom_in, gap_in=0.16, label_gap_in=0.05
             label.left, label.top = X, y
             y = y + (label.height or Inches(0.25)) + Inches(label_gap_in)
         if body is not None:
-            body.left, body.top, body.width = X, y, W
-            h = _table_h(body) if body.has_table else (body.height or 0)
+            body.left, body.top = X, y
+            if body.has_table:
+                _set_table_width(body, W)     # 열 너비까지 같이 맞춘다
+                _fit_table_rows(body)         # 글 양에 맞춰 행 높이 확보
+                h = _table_h(body)
+            else:
+                body.width = W
+                h = body.height or 0
             body.height = h
             y = y + h + Inches(gap_in)
     return y / 914400.0
@@ -217,17 +401,8 @@ _A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 
 
 def _text_width_in(s: str, pt: float) -> float:
-    """글자폭 추정(인치). 한글·한자는 전각(1.0em), 숫자·영문·기호는 반각(0.55em)."""
-    u = 0.0
-    for ch in s:
-        if ('가' <= ch <= '힣' or '㄰' <= ch <= '㆏'
-                or '一' <= ch <= '鿿' or ch in '·／…‘’“”'):
-            u += 1.0
-        elif ch == ' ':
-            u += 0.30
-        else:
-            u += 0.55
-    return u * pt / 72.0
+    """글자폭 추정(인치)."""
+    return _units(s) * pt / 72.0
 
 
 def _center_title_group(grp, txbox, title: str, slide_w: int) -> bool:
@@ -318,14 +493,14 @@ def build_summary(data: dict, pdf_path: str, out_path: str, pages: int = 1,
             bb = bull_boxes[i]
             # 틀이 이미 '→' 를 글머리기호로 찍는다. 본문에도 '→' 가 들어오면
             # '→ →' 로 두 번 찍히므로 앞머리의 기호를 떼어낸다.
-            _lines = []
+            _bul = []
             for _b in (hl[i].get('bullets') or []):
                 _b = str(_b).strip()
                 while _b[:1] in ("→", "·", "-", "•", "▶", "ㆍ"):
                     _b = _b[1:].strip()
                 if _b:
-                    _lines.append(_b)
-            _replace_text_keep_runs(bb.text_frame, "\n".join(_lines))
+                    _bul.append(_b)
+            _replace_text_keep_runs(bb.text_frame, "\n".join(_bul))
             # ★근거: word_wrap 이 꺼져 있어 한 줄이 꺾쇠 밖으로 뚫고 나갔다 → 켜서 안에서 접히게.
             bb.left, bb.width = _BODY_L, _BODY_W
             bb.text_frame.word_wrap = True
@@ -506,6 +681,25 @@ def build_summary(data: dict, pdf_path: str, out_path: str, pages: int = 1,
     slots = dict(data.get("_slots") or DEFAULT1)
     slots2 = dict(data.get("_slots2") or (DEFAULT2 if pages >= 2 else {}))
 
+    # ── ★고정 7항목 말고, 원본에서 찾은 다른 내용도 칸에 넣을 수 있게 ──
+    #   [라벨 + 2열 표] 한 벌씩 미리 만들어 둔다. 반드시 슬라이드 복제 **전**에
+    #   만들어야 2페이지짜리에서도 둘째 장이 같은 블록을 갖는다.
+    #   고르지 않은 블록은 아래 _arrange 가 지운다.
+    _lbl_proto = _find_label(s3, "사업일정")
+    _tbl_proto = next((sh for sh in s3.shapes
+                       if sh.has_table and len(sh.table.columns) == 2), None)
+    _extra_order = []
+    if _tbl_proto is not None:
+        _wanted = {k for _s in (slots, slots2)
+                   for _side in ("left", "right") for k in (_s.get(_side) or [])}
+        for _title, _pairs in extra_blocks_of(data):
+            if _wanted and _title not in _wanted:
+                continue          # 안 고른 항목은 애초에 만들지 않는다
+            _build_extra_block(s3, _tbl_proto, _lbl_proto, _title, _pairs)
+            _extra_order.append(_title)
+
+    _FIXED_N = 6      # 틀에 원래 있는 표 6개(L, TR, F, C, B, SC)
+
     def _blocks_of(slide):
         """그 슬라이드의 '항목명 → (라벨, 본문)' 지도.
            복제본도 표 순서·라벨 문구가 같으므로 똑같이 찾을 수 있다."""
@@ -514,7 +708,7 @@ def build_summary(data: dict, pdf_path: str, out_path: str, pages: int = 1,
         pic = next((sh for sh in slide.shapes
                     if sh.shape_type == 13 and (sh.width or 0) > Inches(4)
                     and (sh.top or 0) < Inches(2.6)), None)
-        return {
+        m = {
             "사모사채개요": (None, B),
             "담보대출조건": (_find_label(slide, "담보대출"), L),
             "대출조건표":   (None, TR),
@@ -523,6 +717,11 @@ def build_summary(data: dict, pdf_path: str, out_path: str, pages: int = 1,
             "재무제표":     (_find_label(slide, "재무현황"), F),
             "조감도":       (None, pic),
         }
+        # 뒤에 붙인 '그 밖의 내용' 블록 — 만든 순서 = 표 순서.
+        for _i, _k in enumerate(_extra_order):
+            _ti = _FIXED_N + _i
+            m[_k] = (_find_label(slide, _k), ts[_ti] if _ti < len(ts) else None)
+        return m
 
     def _arrange(slide, sl, tag):
         """고른 블록만 남기고 위에서부터 다시 쌓는다."""

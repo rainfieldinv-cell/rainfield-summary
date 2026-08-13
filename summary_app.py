@@ -12,7 +12,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from summary_pipeline import (extract_summary, build_summary,      # noqa: E402
-                              build_highlight_preview)
+                              build_highlight_preview, extra_blocks_of)
 from engine_bits import (page_png, page_count, find_es_pages,      # noqa: E402
                          pptx_slide_png)
 
@@ -348,7 +348,12 @@ elif step == 3:
             "재무제표":     bool(data.get("재무제표")),
             "조감도":       bool(data.get("이미지_있음", True)),
         }
+        # ★목록은 '기본 7항목' 을 위에, 원본에서 찾은 그 밖의 내용을 그 아래에.
+        _SEP = "──── 원본의 그 밖의 내용 ────"      # 고르면 (비움)으로 친다
+        EXTRA = [t for t, _p in extra_blocks_of(data)]
         OPTS = ["(비움)"] + [k for k, v in AVAIL.items() if v]
+        if EXTRA:
+            OPTS += [_SEP] + EXTRA
         MISSING = [k for k, v in AVAIL.items() if not v]
 
         # ── 페이지 수 먼저 고른다(1장이냐 2장이냐에 따라 아래 배치가 달라짐) ──
@@ -384,9 +389,10 @@ elif step == 3:
             for i in range(len(seq)):
                 c1, c2, c3, c4 = st.columns([6, 1, 1, 1])
                 cur = seq[i] if seq[i] in OPTS else "(비움)"
-                seq[i] = c1.selectbox(
+                _pick = c1.selectbox(
                     f"{i + 1}번 칸", OPTS, index=OPTS.index(cur),
                     key=f"sl{tag}_{side}_{i}", label_visibility="collapsed")
+                seq[i] = "(비움)" if _pick == _SEP else _pick    # 구분선은 고를 수 없다
                 if c2.button("↑", key=f"up{tag}_{side}_{i}", disabled=(i == 0),
                              help="위로"):
                     seq[i - 1], seq[i] = seq[i], seq[i - 1]
