@@ -56,11 +56,23 @@ def get_client():
     from anthropic import Anthropic
 
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+
+    # 클라우드(Streamlit Cloud)에는 .env를 올리지 않으므로 Secrets에서도 찾아본다.
+    if not api_key:
+        try:
+            import streamlit as _st
+            api_key = str(_st.secrets.get("ANTHROPIC_API_KEY", "")).strip()
+            if api_key:
+                os.environ["ANTHROPIC_API_KEY"] = api_key
+        except Exception:
+            pass
+
     if not api_key:
         raise ValueError(
             "ANTHROPIC_API_KEY가 설정되지 않았습니다.\n"
-            "방법 1: 프로젝트 루트에 .env 파일 생성 후 ANTHROPIC_API_KEY=sk-ant-... 입력\n"
-            "방법 2: 환경변수로 직접 설정 (export ANTHROPIC_API_KEY=sk-ant-...)"
+            "· 웹(Streamlit Cloud): Manage app → Settings → Secrets 에\n"
+            '  ANTHROPIC_API_KEY = "sk-ant-..." 를 넣고 저장하세요(따옴표 필수).\n'
+            "· 내 컴퓨터: 생성기 폴더의 .env 파일에 ANTHROPIC_API_KEY=sk-ant-... 입력"
         )
     return Anthropic(api_key=api_key)
 
