@@ -12,7 +12,12 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from summary_pipeline import (extract_summary, build_summary,      # noqa: E402
-                              build_highlight_preview, extra_blocks_of)
+                              build_highlight_preview)
+try:      # 배포 직후 옛 모듈이 남아 있어도 앱 전체가 죽지 않게 한다
+    from summary_pipeline import extra_blocks_of                   # noqa: E402
+except ImportError:
+    def extra_blocks_of(_data):
+        return []
 from engine_bits import (page_png, page_count, find_es_pages,      # noqa: E402
                          pptx_slide_png)
 

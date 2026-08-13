@@ -32,7 +32,11 @@ if not os.environ.get("ANTHROPIC_API_KEY"):
 
 from pptx import Presentation
 from pptx.util import Inches
-from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE, MSO_ANCHOR
+from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE
+try:
+    from pptx.enum.text import MSO_ANCHOR
+except ImportError:          # python-pptx 버전에 따라 이름이 다르다
+    from pptx.enum.text import MSO_VERTICAL_ANCHOR as MSO_ANCHOR
 from extractors import extract_from_pdf
 import claude_api as _claude_api
 from claude_api import call_claude
