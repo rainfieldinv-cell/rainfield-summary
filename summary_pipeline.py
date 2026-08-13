@@ -31,7 +31,7 @@ if not os.environ.get("ANTHROPIC_API_KEY"):
         pass
 
 from pptx import Presentation
-from pptx.util import Inches
+from pptx.util import Inches, Pt
 from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE
 try:
     from pptx.enum.text import MSO_ANCHOR
@@ -162,19 +162,33 @@ def _dup_slide_after(prs, src, after_idx):
       ④맨 뒤에 생긴 슬라이드를 원하는 위치로 이동
     """
     import copy as _copy
+    _R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
     dst = prs.slides.add_slide(src.slide_layout)
     for sh in list(dst.shapes):
         sh._element.getparent().remove(sh._element)
     for sh in src.shapes:
-        dst.shapes._spTree.append(_copy.deepcopy(sh._element))
-    for rid, rel in src.part.rels.items():
-        try:
-            if rel.is_external:
-                dst.part.rels.add_relationship(rel.reltype, rel._target, rid, True)
-            else:
-                dst.part.rels.add_relationship(rel.reltype, rel._target, rid)
-        except Exception:
-            pass
+        el = _copy.deepcopy(sh._element)
+        # ★그림이 가리키는 관계 번호(rId)는 **슬라이드마다 따로**다.
+        #   XML 만 그대로 베끼면 새 슬라이드에서 그 번호가 없거나 엉뚱한 걸 가리켜
+        #   그림이 안 보인다(2페이지에서 회사 로고가 사라지던 원인).
+        #   → 원본이 쓰던 대상을 새 슬라이드에 다시 연결하고 번호를 바꿔 끼운다.
+        for node in el.iter():
+            for attr in ("embed", "link", "id"):
+                key = _R + attr
+                rid = node.get(key)
+                if not rid:
+                    continue
+                try:
+                    rel = src.part.rels[rid]
+                except KeyError:
+                    continue
+                try:
+                    node.set(key, dst.part.relate_to(
+                        rel.target_ref if rel.is_external else rel._target,
+                        rel.reltype, is_external=rel.is_external))
+                except Exception:
+                    pass
+        dst.shapes._spTree.append(el)
     # 맨 뒤 → after_idx 다음 자리로 이동
     sldIdLst = prs.slides._sldIdLst
     ids = list(sldIdLst)
@@ -348,7 +362,8 @@ def _fit_table_rows(shape):
             need = max(need, max(1, lines) * pt * 1.32 / 72.0 + 0.08)
         # ★'기존 높이와 큰 값'이 아니라 **필요한 만큼**으로 맞춘다.
         #   틀에서 물려받은 큰 행 높이를 그대로 두면 한 줄짜리 칸이 뻥 비어 보인다.
-        row.height = int(Inches(max(0.22, need)))
+        #   최소 높이는 글자 크기를 따라간다(글자를 줄이면 행도 줄어야 한다).
+        row.height = int(Inches(max(0.14, need)))
 
 
 def _table_h(shape):
@@ -357,6 +372,23 @@ def _table_h(shape):
         return sum(r.height for r in shape.table.rows)
     except Exception:
         return shape.height or 0
+
+
+_MIN_TABLE_PT = 6.0      # 이보다 작으면 읽기 힘들다 — 여기서 멈추고 경고를 낸다
+
+
+def _scale_table_font(shape, ratio: float, base_pt: float = 9.0):
+    """표 안 글자 크기를 ratio 배로 줄인다(칸이 넘칠 때만)."""
+    try:
+        t = shape.table
+    except Exception:
+        return
+    for row in t.rows:
+        for cell in row.cells:
+            for para in cell.text_frame.paragraphs:
+                for run in para.runs:
+                    cur = run.font.size.pt if run.font.size else base_pt
+                    run.font.size = Pt(max(_MIN_TABLE_PT, round(cur * ratio, 1)))
 
 
 def _stack(blocks, x_in, w_in, top_in, bottom_in, gap_in=0.16, label_gap_in=0.05):
@@ -371,7 +403,13 @@ def _stack(blocks, x_in, w_in, top_in, bottom_in, gap_in=0.16, label_gap_in=0.05
     y = Inches(top_in)
     for label, body in blocks:
         if label is not None:
-            label.left, label.top = X, y
+            # ★라벨 글상자는 틀에서 1.60in 로 좁다. 회사명이 붙어 길어지면 두 줄로
+            #   접히는데 높이는 그대로라 바로 아래 표를 덮었다 → 단 폭만큼 넓힌다.
+            label.left, label.top, label.width = X, y, W
+            try:
+                label.text_frame.word_wrap = False
+            except Exception:
+                pass
             y = y + (label.height or Inches(0.25)) + Inches(label_gap_in)
         if body is not None:
             body.left, body.top = X, y
@@ -742,14 +780,37 @@ def build_summary(data: dict, pdf_path: str, out_path: str, pages: int = 1,
                         sh._element.getparent().remove(sh._element)
                     except Exception:
                         pass
-        _BOT = 7.28
+        _BOT, _TOP = 7.28, 0.39
         for side, x, w, nm in (("left", 0.25, 4.90, "좌단"), ("right", 5.26, 5.32, "우단")):
             seq = [BL[k] for k in sl.get(side, []) if k in BL]
             seq = [(lb, bd) for lb, bd in seq if bd is not None or lb is not None]
-            end = _stack(seq, x_in=x, w_in=w, top_in=0.39, bottom_in=_BOT)
+            end = _stack(seq, x_in=x, w_in=w, top_in=_TOP, bottom_in=_BOT)
+
+            # ★넘치면 그 단을 줄여서 다시 쌓는다 — 한쪽에 4개를 넣어도 들어가게.
+            #   표는 글자 크기를, 그림은 높이를, 블록 사이 간격까지 함께 줄인다.
+            _gap, _lgap = 0.16, 0.05
+            for _try in range(6):
+                if end <= _BOT:
+                    break
+                _avail, _used = _BOT - _TOP, end - _TOP
+                ratio = max(0.72, (_avail / _used) ** 0.5)   # 한 번에 확 줄이지 않는다
+                for _lb, _bd in seq:
+                    if _bd is None:
+                        continue
+                    if _bd.has_table:
+                        _scale_table_font(_bd, ratio)
+                    elif _bd.shape_type == 13:               # 조감도 등 그림
+                        _bd.height = int(max(Inches(0.8), (_bd.height or 0) * ratio))
+                _gap, _lgap = max(0.07, _gap * ratio), max(0.03, _lgap * ratio)
+                end = _stack(seq, x_in=x, w_in=w, top_in=_TOP, bottom_in=_BOT,
+                             gap_in=_gap, label_gap_in=_lgap)
+
             if end > _BOT:
                 print(f"[요약본] 경고: {tag} {nm} 내용이 {end - _BOT:.2f}in 넘침 "
-                      f"— 칸을 줄이거나 페이지를 나눠야 함")
+                      f"— 글자를 최소까지 줄였는데도 안 들어감. 칸을 줄이거나 "
+                      f"페이지를 나눠야 함")
+            elif _try:
+                print(f"[요약본] {tag} {nm}: 내용이 많아 표 글자를 줄여 맞췄음")
 
     if pages >= 2:
         # ★내용을 다 채운 뒤 통째로 복제 → 각 장에서 필요없는 블록만 지운다.
