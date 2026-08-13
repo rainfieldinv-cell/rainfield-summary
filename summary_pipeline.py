@@ -204,6 +204,66 @@ def build_highlight_preview(data: dict, out_path: str) -> str:
     return build_summary(data, None, out_path, pages=1, _highlight_only=True)
 
 
+# ── 하이라이트 제목 블록([체크아이콘]+[제목]) 가운데 정렬 ───────────────
+#   문제: 레이아웃 틀의 제목 그룹 3개가 전부 L4.66" W1.52" 로 **고정**이고
+#   그 안 글상자는 폭 1.04" 짜리다. 제목이 그보다 길면 글이 상자를 뚫고
+#   오른쪽으로만 자라서, **글자 수가 다르면 카드마다 제목 위치가 어긋났다.**
+#   (예: '초역세권 입지' 6자 vs '낮은 인허가 리스크' 9자)
+#   해결: 제목 글자폭을 재서 그룹 폭을 실제 내용에 맞추고, 그룹 전체를
+#   슬라이드 정중앙에 놓는다. 기존 IM 변환기의 하이라이트와 같은 방식.
+_TITLE_PT = 18.0    # 틀의 제목 rPr 에 sz 가 없다 → 본문 기본값 18pt
+_ICON_GAP = 0.08    # 체크아이콘과 제목 사이 간격(인치)
+_A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+
+
+def _text_width_in(s: str, pt: float) -> float:
+    """글자폭 추정(인치). 한글·한자는 전각(1.0em), 숫자·영문·기호는 반각(0.55em)."""
+    u = 0.0
+    for ch in s:
+        if ('가' <= ch <= '힣' or '㄰' <= ch <= '㆏'
+                or '一' <= ch <= '鿿' or ch in '·／…‘’“”'):
+            u += 1.0
+        elif ch == ' ':
+            u += 0.30
+        else:
+            u += 0.55
+    return u * pt / 72.0
+
+
+def _center_title_group(grp, txbox, title: str, slide_w: int) -> bool:
+    """[체크아이콘 + 제목] 그룹을 글자폭에 맞춰 다시 재고 슬라이드 가운데로 옮긴다."""
+    xfrm = grp._element.find(f"{_A}xfrm")
+    if xfrm is None:                       # grpSpPr 안에 있는 경우
+        xfrm = grp._element.find(f".//{_A}xfrm")
+    if xfrm is None:
+        return False
+    off, ext = xfrm.find(f"{_A}off"), xfrm.find(f"{_A}ext")
+    ch_off, ch_ext = xfrm.find(f"{_A}chOff"), xfrm.find(f"{_A}chExt")
+    if None in (off, ext, ch_off, ch_ext):
+        return False
+
+    pics = [c for c in grp.shapes if c.shape_type == 13]
+    if not pics:
+        return False
+    icon = pics[0]
+    icon_w = icon.width or Inches(0.47)
+
+    base_x = int(ch_off.get("x"))          # 자식 좌표계의 왼쪽 끝
+    text_w = int(Inches(_text_width_in(title or "", _TITLE_PT) + 0.06))
+    text_w = max(text_w, Inches(0.4))
+
+    # 자식 좌표계 재배치: [아이콘][간격][제목]
+    icon.left = base_x
+    txbox.left = base_x + icon_w + Inches(_ICON_GAP)
+    txbox.width = text_w
+
+    total = icon_w + Inches(_ICON_GAP) + text_w
+    ext.set("cx", str(int(total)))          # 확대·축소 없이 1:1 이 되도록
+    ch_ext.set("cx", str(int(total)))
+    off.set("x", str(int((slide_w - total) / 2)))   # 슬라이드 정중앙
+    return True
+
+
 def build_summary(data: dict, pdf_path: str, out_path: str, pages: int = 1,
                   _highlight_only: bool = False) -> str:
     prs = Presentation(_layout_path())
@@ -222,32 +282,50 @@ def build_summary(data: dict, pdf_path: str, out_path: str, pages: int = 1,
         if sh.shape_type == 6:
             for ch in sh.shapes:
                 if ch.has_text_frame and ch.text_frame.text.strip() == "제목":
-                    title_boxes.append((sh.top, ch))
-    title_boxes = [b for _, b in sorted(title_boxes, key=lambda x: x[0])]
+                    title_boxes.append((sh.top, sh, ch))   # (정렬키, 그룹, 글상자)
+    title_boxes = [(g, c) for _, g, c in sorted(title_boxes, key=lambda x: x[0])]
     sub_boxes = sorted([sh for sh in s2.shapes if sh.has_text_frame and sh.text_frame.text.strip() == "부제목"],
                        key=lambda sh: sh.top)
     bull_boxes = sorted([sh for sh in s2.shapes if sh.has_text_frame and len(sh.text_frame.text.strip()) > 20],
                         key=lambda sh: sh.top)
     # 슬라이드 폭(요약본 레이아웃은 10.83in) 기준으로 꺾쇠 안쪽에 맞춘다
     _SW = prs.slide_width
-    _BODY_L, _BODY_W = Inches(1.80), Inches(7.40)      # 꺾쇠(1.45~9.39in) 안쪽
+    # 꺾쇠는 1.45~9.39in 이지만 양끝의 화살촉이 안쪽으로 파고든다.
+    # 7.40in 로 두면 긴 줄이 오른쪽 화살촉에 닿았다 → 기존 IM 변환기와 같은 여백으로.
+    _BODY_L, _BODY_W = Inches(1.80), Inches(7.00)
 
     for i in range(min(3, len(hl))):
         if i < len(title_boxes):
-            tb = title_boxes[i]
-            _replace_text_keep_runs(tb.text_frame, hl[i].get('title', ''))
-            # ★제목: 글상자가 좁은데 가운데정렬이라 글이 양옆으로 번져 **왼쪽 체크 아이콘을 덮었다.**
-            #   왼쪽정렬로 두면 아이콘 오른쪽에서 오른쪽으로만 자란다.
+            grp, tb = title_boxes[i]
+            _title = (hl[i].get('title') or '').strip()
+            _replace_text_keep_runs(tb.text_frame, _title)
+            # 제목은 아이콘 오른쪽에서 시작(왼쪽정렬)하고, 아이콘까지 묶은 블록을
+            # _center_title_group 이 슬라이드 정중앙으로 옮긴다.
             tb.text_frame.word_wrap = False
             for p in tb.text_frame.paragraphs:
                 p.alignment = PP_ALIGN.LEFT
+            _center_title_group(grp, tb, _title, _SW)
         if i < len(sub_boxes):
             sb = sub_boxes[i]
             _replace_text_keep_runs(sb.text_frame, hl[i].get('subtitle', ''))
+            # 부제목은 가운데정렬이라 폭만 넉넉히 주면 알아서 가운데에 선다.
+            # (틀의 2.58" 를 그대로 두면 긴 부제목이 두 줄로 접힌다.)
+            sb.left, sb.width = _BODY_L, _BODY_W
             sb.text_frame.word_wrap = False
+            for p in sb.text_frame.paragraphs:
+                p.alignment = PP_ALIGN.CENTER
         if i < len(bull_boxes):
             bb = bull_boxes[i]
-            _replace_text_keep_runs(bb.text_frame, "\n".join(hl[i].get('bullets', [])))
+            # 틀이 이미 '→' 를 글머리기호로 찍는다. 본문에도 '→' 가 들어오면
+            # '→ →' 로 두 번 찍히므로 앞머리의 기호를 떼어낸다.
+            _lines = []
+            for _b in (hl[i].get('bullets') or []):
+                _b = str(_b).strip()
+                while _b[:1] in ("→", "·", "-", "•", "▶", "ㆍ"):
+                    _b = _b[1:].strip()
+                if _b:
+                    _lines.append(_b)
+            _replace_text_keep_runs(bb.text_frame, "\n".join(_lines))
             # ★근거: word_wrap 이 꺼져 있어 한 줄이 꺾쇠 밖으로 뚫고 나갔다 → 켜서 안에서 접히게.
             bb.left, bb.width = _BODY_L, _BODY_W
             bb.text_frame.word_wrap = True

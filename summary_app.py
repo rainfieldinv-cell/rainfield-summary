@@ -117,6 +117,14 @@ if step == 1:
                 while len(hl) < 3:
                     hl.append({"title": "", "subtitle": "", "bullets": []})
                 st.session_state["hl"] = hl
+                # 다른 PDF를 올렸는데 앞 원본의 카드 글이 남지 않도록 위젯도 갈아끼운다.
+                for _i in range(3):
+                    _sub = (hl[_i].get("subtitle") or "").strip()
+                    st.session_state[f"ht_{_i}"] = hl[_i].get("title", "") or ""
+                    st.session_state[f"hs_{_i}"] = _sub
+                    st.session_state[f"hb_{_i}"] = "\n".join(hl[_i].get("bullets") or [])
+                    st.session_state[f"hu_{_i}"] = bool(_sub)
+                st.session_state.pop("hl_prev", None)
             except Exception as e:
                 import traceback
                 st.error(f"추출 실패: {e}")
@@ -148,6 +156,21 @@ elif step == 2:
         st.warning("먼저 1단계에서 원본을 올려주세요.")
     else:
         _pdf = st.session_state.get("_pdf_bytes")
+
+        # ★위젯 값을 카드 데이터에 강제로 맞춘다.
+        #   예전엔 키를 pop 하고 text_input(value=...) 으로 되돌렸는데,
+        #   Streamlit 이 위젯 값을 자체 저장소에도 들고 있어 제목·내용이 되살아났다
+        #   ('카드 3개 비우기' 를 눌러도 부제목만 사라지던 원인).
+        #   → 세션 상태의 위젯 키에 직접 써 넣으면 확실하게 반영된다.
+        def _sync_card_widgets(cards):
+            for _i in range(3):
+                _h = cards[_i]
+                _sub = (_h.get("subtitle") or "").strip()
+                st.session_state[f"ht_{_i}"] = _h.get("title", "") or ""
+                st.session_state[f"hs_{_i}"] = _sub
+                st.session_state[f"hb_{_i}"] = "\n".join(_h.get("bullets") or [])
+                st.session_state[f"hu_{_i}"] = bool(_sub)
+
         hb1, hb2, _ = st.columns([2, 2, 3])
         if hb1.button("🤖 Executive Summary 자동 추출", use_container_width=True,
                       help="IM의 'Executive Summary' 항목만 읽어 3개 카드로 정리합니다"
@@ -157,16 +180,14 @@ elif step == 2:
             while len(hl) < 3:
                 hl.append({"title": "", "subtitle": "", "bullets": []})
             st.session_state["hl"] = hl
-            for i in range(3):
-                for k in (f"ht_{i}", f"hs_{i}", f"hb_{i}", f"hu_{i}"):
-                    st.session_state.pop(k, None)
+            _sync_card_widgets(hl)
             st.rerun()
-        if hb2.button("🧹 카드 3개 비우기", use_container_width=True):
-            st.session_state["hl"] = [{"title": "", "subtitle": "", "bullets": []}
-                                      for _ in range(3)]
-            for i in range(3):
-                for k in (f"ht_{i}", f"hs_{i}", f"hb_{i}", f"hu_{i}"):
-                    st.session_state.pop(k, None)
+        if hb2.button("🧹 카드 3개 비우기", use_container_width=True,
+                      help="제목·부제목·내용을 카드 3개 모두 비웁니다."):
+            blank = [{"title": "", "subtitle": "", "bullets": []} for _ in range(3)]
+            st.session_state["hl"] = blank
+            _sync_card_widgets(blank)
+            st.session_state.pop("hl_prev", None)      # 옛 미리보기 이미지도 버린다
             st.rerun()
 
         # 자동 추출 결과 안내(기본 IM 변환기와 동일한 초록 배너)
@@ -239,23 +260,27 @@ elif step == 2:
                 h = st.session_state["hl"][i]
                 with st.container(border=True):
                     st.markdown(f"**카드 {i + 1}**")
+                    # ★값은 항상 세션 상태의 위젯 키로만 오간다(value= 를 쓰지 않는다).
+                    #   둘을 섞으면 어느 쪽이 이기는지가 갈려 '비우기'가 안 먹었다.
+                    _sub0 = (h.get("subtitle") or "").strip()
+                    st.session_state.setdefault(f"ht_{i}", h.get("title", "") or "")
+                    st.session_state.setdefault(f"hs_{i}", _sub0)
+                    st.session_state.setdefault(f"hb_{i}",
+                                                "\n".join(h.get("bullets") or []))
+                    st.session_state.setdefault(f"hu_{i}", bool(_sub0))
+
                     h["title"] = st.text_input(
-                        "✓ 제목", value=h.get("title", ""), key=f"ht_{i}",
-                        placeholder="예: 낮은 인허가 리스크")
+                        "✓ 제목", key=f"ht_{i}", placeholder="예: 낮은 인허가 리스크")
                     # ★부제목은 '선택사항' — 기존 IM 자동화와 동일하게 체크박스로 켠다.
-                    _uk = f"hu_{i}"
-                    if _uk not in st.session_state:
-                        st.session_state[_uk] = bool((h.get("subtitle") or "").strip())
-                    h["use_sub"] = st.checkbox("부제목 넣기", key=_uk)
+                    h["use_sub"] = st.checkbox("부제목 넣기", key=f"hu_{i}")
                     if h["use_sub"]:
                         h["subtitle"] = st.text_input(
-                            "부제목 (하늘색 줄)", value=h.get("subtitle", ""),
-                            key=f"hs_{i}", placeholder="예: 주요 심의·평가 완료 단계")
+                            "부제목 (하늘색 줄)", key=f"hs_{i}",
+                            placeholder="예: 주요 심의·평가 완료 단계")
                     else:
                         h["subtitle"] = ""
                     h["bullets"] = [b for b in st.text_area(
-                        "내용", value="\n".join(h.get("bullets", []) or []),
-                        key=f"hb_{i}", height=110,
+                        "내용", key=f"hb_{i}", height=110,
                         placeholder="카드 본문 (여러 줄 입력 가능)"
                         ).split("\n") if b.strip()]
 
