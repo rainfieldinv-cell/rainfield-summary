@@ -1,0 +1,7 @@
+streamlit
+python-pptx
+PyMuPDF
+python-docx
+Pillow
+anthropic
+python-dotenv

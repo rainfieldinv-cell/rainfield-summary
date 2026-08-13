@@ -1,0 +1,15 @@
+# 비밀정보 — 절대 올리지 않는다
+.env
+.streamlit/secrets.toml
+
+# LLM 응답 캐시(로컬 전용, 용량 큼)
+.claude_cache/
+
+# 파이썬 캐시
+__pycache__/
+*.pyc
+
+# 임시·산출물
+*.tmp
+_*.pptx
+산출물/
