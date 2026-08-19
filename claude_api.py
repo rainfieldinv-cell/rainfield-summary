@@ -18,6 +18,7 @@ import json
 import os
 import re
 import hashlib
+import threading
 from pathlib import Path
 
 # ─────────────────────────────────────────────
@@ -135,11 +136,17 @@ def call_claude(
     cache_file = CACHE_DIR / f"{cache_key}.json"
 
     # ── 캐시 히트 ────────────────────────────────────────────
+    #   ★여러 사람이 동시에 쓰는 웹앱이다. 다른 사람이 같은 캐시 파일을
+    #     쓰는 중이면 반쯤 쓰인 내용을 읽을 수 있다 → 깨졌으면 조용히 무시하고
+    #     그냥 API 를 부른다(캐시는 '있으면 빠른 것'이지 없어도 되는 것).
     if use_cache and cache_file.exists():
-        cached = json.loads(cache_file.read_text(encoding="utf-8"))
-        cached["cached"] = True
-        print(f"[claude_api] slide={slide_num} CACHE HIT ({cache_key[:12]}…)")
-        return cached
+        try:
+            cached = json.loads(cache_file.read_text(encoding="utf-8"))
+            cached["cached"] = True
+            print(f"[claude_api] slide={slide_num} CACHE HIT ({cache_key[:12]}…)")
+            return cached
+        except Exception as e:
+            print(f"[claude_api] 캐시 무시({cache_key[:12]}… {type(e).__name__}) — 새로 호출")
 
     # ── API 호출 ─────────────────────────────────────────────
     client   = get_client()
@@ -210,8 +217,16 @@ def call_claude(
     }
 
     # ── 캐시 저장 ─────────────────────────────────────────────
+    #   ★같은 이름으로 바로 쓰면, 쓰는 도중에 다른 사람이 그 파일을 읽어
+    #     반쪽짜리 JSON 을 집는다. 임시 이름으로 다 쓴 뒤 이름만 바꾼다(원자적 교체).
     if use_cache and data is not None:
-        cache_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            tmp = cache_file.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps(result, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+            os.replace(tmp, cache_file)
+        except Exception as e:
+            print(f"[claude_api] 캐시 저장 실패({type(e).__name__}) — 결과는 정상 반환")
 
     return result
 
