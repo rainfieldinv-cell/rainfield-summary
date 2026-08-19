@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>레인필드 요약본 생성기</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; display: flex; justify-content: center; align-items: center;
+      height: 100vh; background: #f5f7fa;
+      font-family: 'Malgun Gothic', sans-serif; color: #333;
+    }
+    .box { text-align: center; max-width: 460px; padding: 0 20px; }
+    .title { font-size: 24px; font-weight: bold; margin-bottom: 8px; }
+    .tag { font-size: 13px; color: #7a869a; margin-bottom: 18px; }
+    .sub { font-size: 14px; color: #888; line-height: 1.7; }
+    a.btn {
+      display: inline-block; margin-top: 18px; background: #08377C; color: #fff;
+      text-decoration: none; font-weight: bold; font-size: 14px;
+      padding: 10px 22px; border-radius: 6px;
+    }
+    .hint {
+      margin-top: 22px; padding: 14px 18px; text-align: left;
+      background: #fff; border: 1px solid #DCE6F1; border-radius: 8px;
+      font-size: 13px; line-height: 1.8; color: #555;
+    }
+    .hint b { color: #08377C; }
+    .spin {
+      display: inline-block; width: 14px; height: 14px; vertical-align: -2px;
+      border: 2px solid #cdd4e6; border-top-color: #08377C; border-radius: 50%;
+      animation: r .8s linear infinite; margin-right: 6px;
+    }
+    @keyframes r { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <div class="title">레인필드 요약본 생성기</div>
+    <div class="tag">원본 IM(PDF) → 4~5장 요약본</div>
+
+    <div class="sub"><span class="spin"></span>생성기로 이동합니다…<br><br>
+      이동하지 않으면
+      <a href="https://rainfieldinv-cell-rainfield-summary-summary-app-1tesa4.streamlit.app"
+         target="_blank">여기를 클릭</a>
+    </div>
+
+    <a class="btn"
+       href="https://rainfieldinv-cell-rainfield-summary-summary-app-1tesa4.streamlit.app"
+       target="_blank">요약본 생성기 열기</a>
+
+    <div class="hint">
+      <b>웹으로 열립니다.</b> 회사 어느 컴퓨터에서나 같은 주소로 쓸 수 있습니다.<br><br>
+      한동안 아무도 쓰지 않았다면 <b>20~30초</b> 깨어나는 시간이 걸립니다.
+    </div>
+  </div>
+
+  <script>
+    // ★기본은 웹앱(기존 IM 진입점과 동일한 방식). 회사 어느 PC에서나 열린다.
+    //   다만 이 PC처럼 로컬 서버가 떠 있으면 그쪽이 더 빠르고
+    //   '완성본 미리보기'(파워포인트 필요)까지 되므로 로컬을 먼저 쓴다.
+    const WEB   = "https://rainfieldinv-cell-rainfield-summary-summary-app-1tesa4.streamlit.app";
+    const LOCAL = "http://localhost:8502";
+    const timeout = ms => new Promise((_, rej) => setTimeout(rej, ms));
+
+    Promise.race([
+      fetch(LOCAL + "/_stcore/health", { mode: "no-cors", cache: "no-store" }),
+      timeout(1200)                       // 로컬이 없으면 1.2초만 기다리고 웹으로
+    ])
+      .then(() => location.href = LOCAL)
+      .catch(() => location.href = WEB);
+  </script>
+</body>
+</html>
