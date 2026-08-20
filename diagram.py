@@ -13,7 +13,7 @@ import re
 from copy import deepcopy
 
 from pptx import Presentation
-from pptx.util import Emu
+from pptx.util import Emu, Pt
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 LAYOUT = os.path.join(_HERE, "layout", "금융구조도_모음.pptx")
@@ -177,6 +177,140 @@ def thumb_path(no: int):
     """그 구조도의 미리보기 사진 경로(없으면 None)."""
     p = os.path.join(THUMBS, f"{no:02d}.png")
     return p if os.path.exists(p) else None
+
+
+# ── 만든 구조도를 요약본에 끼워 넣기 ──────────────────
+_A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_P = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+_R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+
+
+def insert_diagram(dst_slide, pptx_path: str, logo_below_in: float = 0.95):
+    """구조도 PPT(한 장)의 도형을 **그대로** 요약본 슬라이드에 옮겨 붙인다.
+
+    그림으로 바꾸지 않는 이유: 웹 서버에는 파워포인트가 없어 그림으로 못 바꾼다.
+    도형째 옮기면 변환이 필요 없고, 확대해도 안 깨지고, 나중에 글자도 고칠 수 있다.
+
+    반환: 옮겨 붙인 도형들을 묶은 그룹(위치·크기는 부르는 쪽에서 정한다).
+           넣을 게 없으면 None.
+    """
+    from lxml import etree
+    src = Presentation(pptx_path).slides[0]
+    sw = Presentation(pptx_path).slide_width
+
+    picks = []
+    for sh in src.shapes:                      # 맨 바깥 도형만(그룹은 통째로)
+        try:
+            l, t = sh.left or 0, sh.top or 0
+            w, h = sh.width or 0, sh.height or 0
+        except Exception:
+            continue
+        if w <= 0 or h <= 0:
+            continue
+        if t < Emu(int(logo_below_in * EMU_IN)):
+            continue                            # 로고·구조도 제목은 뺀다
+        if w > sw * 0.95:
+            continue                            # 슬라이드 전체를 덮는 액자
+        picks.append((sh, l, t, w, h))
+    if not picks:
+        return None
+
+    x0 = min(p[1] for p in picks)
+    y0 = min(p[2] for p in picks)
+    x1 = max(p[1] + p[3] for p in picks)
+    y1 = max(p[2] + p[4] for p in picks)
+    cx, cy = max(1, x1 - x0), max(1, y1 - y0)
+
+    grp = etree.SubElement(dst_slide.shapes._spTree, _P + "grpSp")
+    nv = etree.SubElement(grp, _P + "nvGrpSpPr")
+    c = etree.SubElement(nv, _P + "cNvPr")
+    c.set("id", "9001")
+    c.set("name", "금융구조도")
+    etree.SubElement(nv, _P + "cNvGrpSpPr")
+    etree.SubElement(nv, _P + "nvPr")
+    spPr = etree.SubElement(grp, _P + "grpSpPr")
+    xf = etree.SubElement(spPr, _A + "xfrm")
+    for tag, a, b in (("off", x0, y0), ("ext", cx, cy),
+                      ("chOff", x0, y0), ("chExt", cx, cy)):
+        e = etree.SubElement(xf, _A + tag)
+        if tag in ("off", "chOff"):
+            e.set("x", str(int(a)))
+            e.set("y", str(int(b)))
+        else:
+            e.set("cx", str(int(a)))
+            e.set("cy", str(int(b)))
+
+    for sh, *_ in picks:
+        el = deepcopy(sh._element)
+        # 그림이 가리키는 관계 번호는 슬라이드마다 다르다 → 다시 맺어준다.
+        for node in el.iter():
+            for attr in ("embed", "link", "id"):
+                k = _R + attr
+                rid = node.get(k)
+                if not rid:
+                    continue
+                try:
+                    rel = src.part.rels[rid]
+                except KeyError:
+                    continue
+                try:
+                    node.set(k, dst_slide.part.relate_to(
+                        rel.target_ref if rel.is_external else rel._target,
+                        rel.reltype, is_external=rel.is_external))
+                except Exception:
+                    pass
+        grp.append(el)
+    return dst_slide.shapes[-1]
+
+
+def scale_tables_in_group(grp, ratio: float, min_pt: float = 4.5):
+    """그룹을 줄일 때 따라오지 않는 것들을 직접 줄인다.
+
+    그룹을 줄이면 도형의 '자리와 크기'는 같이 줄지만, 다음 둘은 안 줄어든다.
+      · **표(graphicFrame)** — 아예 크기가 안 변한다(OOXML 특성). 상자들이 겹친다.
+      · **글자 크기** — 도형은 작아지는데 글씨는 그대로라 밖으로 넘친다.
+    그래서 열 너비·행 높이·글꼴 크기를 우리가 직접 곱해준다.
+    """
+    if ratio <= 0 or abs(ratio - 1.0) < 0.01:
+        return
+
+    # ① 글상자 글자 크기 (도형 자체는 그룹이 알아서 줄여준다)
+    for sh, _p in _walk(grp.shapes):
+        if sh.has_table or not sh.has_text_frame:
+            continue
+        for para in sh.text_frame.paragraphs:
+            for run in para.runs:
+                cur = run.font.size.pt if run.font.size else 11.0
+                run.font.size = Pt(max(min_pt, round(cur * ratio, 1)))
+
+    # ② 표 — 크기·글자 둘 다
+    for sh, _p in _walk(grp.shapes):
+        if not sh.has_table:
+            continue
+        t = sh.table
+        try:
+            for col in t.columns:
+                col.width = int((col.width or 0) * ratio)
+            for row in t.rows:
+                row.height = int((row.height or 0) * ratio)
+        except Exception:
+            pass
+        for row in t.rows:
+            for cell in row.cells:
+                for para in cell.text_frame.paragraphs:
+                    for run in para.runs:
+                        cur = run.font.size.pt if run.font.size else 9.0
+                        run.font.size = Pt(max(min_pt, round(cur * ratio, 1)))
+        try:                     # 칸 안쪽 여백도 같이 줄여야 글이 안 넘친다
+            for row in t.rows:
+                for cell in row.cells:
+                    for a in ("margin_left", "margin_right",
+                              "margin_top", "margin_bottom"):
+                        v = getattr(cell, a, None)
+                        if v:
+                            setattr(cell, a, int(v * ratio))
+        except Exception:
+            pass
 
 
 # ── 채운 구조도 만들기 ───────────────────────────────

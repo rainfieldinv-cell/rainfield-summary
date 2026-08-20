@@ -20,8 +20,81 @@ except ImportError:
         return []
 from engine_bits import (page_png, page_count, find_es_pages,      # noqa: E402
                          pptx_slide_png)
+import json                                                        # noqa: E402
+import diagram as _dg                                              # noqa: E402
 
-STEP_NAMES = ["원본 업로드", "하이라이트", "내용", "생성"]
+STEP_NAMES = ["원본 업로드", "하이라이트", "금융구조도", "내용 배치", "생성"]
+
+
+# ── 3단계(금융구조도) 도우미 ─────────────────────────
+@st.cache_data(show_spinner=False)
+def _diag_layouts():
+    """구조도 틀 목록. 틀 PPT 는 안 바뀌므로 한 번만 읽는다."""
+    return _dg.read_layouts()
+
+
+@st.cache_data(show_spinner=False)
+def _diag_tags():
+    """구조도 종류 태그(layout/구조도_분류.json). 없거나 깨져도 그냥 넘어간다."""
+    p = os.path.join(_HERE, "layout", "구조도_분류.json")
+    try:
+        raw = json.load(open(p, encoding="utf-8"))
+        return {int(k): v for k, v in raw.items() if k.isdigit()}
+    except Exception:
+        return {}
+
+
+def _diag_thumb(no):
+    return _dg.thumb_path(no)
+
+
+def _diag_build(no, values, out_path, removed=None):
+    return _dg.build_diagram(no, values, out_path, removed=removed)
+
+
+def _diag_autofill(data, layout):
+    """원본에서 뽑아둔 값으로 구조도 항목을 미리 채운다.
+
+    틀에 적힌 글(차주·시공사·신탁사 …)을 단서로 이 딜의 값을 찾아 넣는다.
+    못 찾으면 그냥 틀의 글을 그대로 둔다(지어내지 않는다).
+    """
+    loan = data.get("담보대출조건") or {}
+    corp = data.get("법인개요") or {}
+    bond = data.get("사모사채개요") or {}
+    hint = {
+        "차주": loan.get("차주") or corp.get("회사명"),
+        "시공사": data.get("시공사"),
+        "신탁사": data.get("신탁사"),
+        "연대보증": data.get("연대보증사"),
+        "발행": bond.get("발행인"),
+        "사채권자": bond.get("사채권자"),
+    }
+    tr = [t for t in (loan.get("tranches") or []) if isinstance(t, dict)]
+
+    out, used_tr = {}, 0
+    for f in layout["fields"]:
+        txt = (f.get("text") or "").strip()
+        if not txt:
+            continue
+        # 상자 두 줄짜리는 윗줄이 역할(차주/시공사), 아랫줄이 이름 → 아랫줄을 채운다
+        if f["mark"].endswith("-1"):
+            head = f["mark"][0]
+            role = next((g["text"] for g in layout["fields"]
+                         if g["mark"] == head), "")
+            for key, val in hint.items():
+                if val and key in role:
+                    out[f["key"]] = str(val)
+                    break
+            continue
+        # Tr.A / Tr.B 같은 금액 칸
+        low = txt.replace(" ", "").lower()
+        if low.startswith("tr.") or "억원" in txt:
+            if used_tr < len(tr):
+                amt = tr[used_tr].get("대출금액")
+                if amt:
+                    out[f["key"]] = str(amt)
+                used_tr += 1
+    return out
 
 st.set_page_config(page_title="Rainfield 요약본 생성기", layout="wide")
 
@@ -335,9 +408,183 @@ elif step == 2:
 
 
 # ──────────────────────────────────────────────────
-# 3단계 — 내용
+# 3단계 — 금융구조도
 # ──────────────────────────────────────────────────
 elif step == 3:
+    st.markdown("### 3단계 · 금융구조도")
+    st.caption("이 딜의 **자금 흐름을 그림으로** 만드는 단계입니다. 회사에서 쓰던 구조도 틀 "
+               "중 비슷한 것을 고르고, 회사 이름과 금액만 채우면 됩니다. "
+               "백지에서 그리지 않아도 됩니다. **건너뛰어도 됩니다.**")
+    if not data:
+        st.warning("먼저 1단계에서 원본을 올려주세요.")
+    else:
+        try:
+            _LAYOUTS = _diag_layouts()
+        except Exception as e:
+            _LAYOUTS = []
+            st.error(f"구조도 틀을 읽지 못했습니다 — {e}")
+
+        # ── ① 어떤 구조도를 쓸지 고르기 ─────────────
+        st.markdown("#### ① 비슷한 구조도를 고르세요")
+        st.caption("그림을 보고 이 딜과 가장 비슷한 것을 고르면 됩니다. "
+                   "완전히 같지 않아도 됩니다 — 다음에서 항목을 고치고 뺄 수 있어요.")
+
+        _tags = _diag_tags()
+        _kinds = ["전체"] + sorted({t for v in _tags.values() for t in v})
+        _pick_kind = st.radio("종류로 걸러보기", _kinds, horizontal=True,
+                              help="분류가 애매한 구조도는 어느 것을 고르든 항상 보입니다.")
+        _shown = [d for d in _LAYOUTS
+                  if _pick_kind == "전체" or not _tags.get(d["no"])
+                  or _pick_kind in _tags.get(d["no"], [])]
+
+        _cur = st.session_state.get("diag_no")
+        _cols = st.columns(3)
+        for _i, _d in enumerate(_shown):
+            with _cols[_i % 3]:
+                _tp = _diag_thumb(_d["no"])
+                if _tp:
+                    st.image(_tp, use_container_width=True)
+                _lab = f"{'✅ ' if _cur == _d['no'] else ''}{_d['title']}"
+                if st.button(_lab, key=f"dg_{_d['no']}", use_container_width=True,
+                             help="이 구조도로 만들기"):
+                    st.session_state["diag_no"] = _d["no"]
+                    for _k in list(st.session_state.keys()):
+                        if _k.startswith("dv_") or _k.startswith("dx_"):
+                            st.session_state.pop(_k, None)
+                    st.session_state.pop("diag_img", None)
+                    st.rerun()
+
+        # ── ② 항목 채우기 ───────────────────────────
+        _no = st.session_state.get("diag_no")
+        if not _no:
+            st.info("위에서 구조도를 하나 고르면 채울 항목이 나옵니다. "
+                    "구조도가 필요 없으면 그냥 다음 단계로 넘어가세요.")
+        else:
+            _d = next((x for x in _LAYOUTS if x["no"] == _no), None)
+            st.markdown("---")
+            st.markdown(f"#### ② 항목 채우기 — {_d['title']}")
+            st.caption("원본에서 찾은 값으로 미리 채워두었습니다. **틀린 것만 고치면 됩니다.** "
+                       "이 딜에 없는 항목은 오른쪽 **빼기** 를 체크하세요(그림에서 상자째 사라집니다). "
+                       "비워두고 넘어가도 됩니다.")
+
+            _auto = _diag_autofill(data, _d)
+            if _auto:
+                st.success(f"원본에서 {len(_auto)}개 항목을 찾아 미리 채웠습니다. 확인·수정하세요.")
+
+            _ic, _fc = st.columns([1.1, 1])
+            with _ic:
+                _tp = _diag_thumb(_no)
+                if _tp:
+                    st.image(_tp, use_container_width=True,
+                             caption="번호는 아래 입력칸을 찾기 쉬우라고 붙인 것입니다. "
+                                     "완성된 구조도에는 나오지 않습니다.")
+            with _fc:
+                for _f in _d["fields"]:
+                    _k = _f["key"]
+                    _vk, _xk = f"dv_{_no}_{_k}", f"dx_{_no}_{_k}"
+                    st.session_state.setdefault(_vk, _auto.get(_k, _f["text"]))
+                    st.session_state.setdefault(_xk, False)
+                    _c1, _c2 = st.columns([5, 1])
+                    _name = f"{_f['kind']} {_f['mark']}" if _f["mark"] else _f["kind"]
+                    _c1.text_input(_name, key=_vk,
+                                   disabled=st.session_state[_xk],
+                                   help=f"틀에 적혀 있던 글 : {_f['text'][:60]}")
+                    _c2.markdown("<div style='height:28px'></div>",
+                                 unsafe_allow_html=True)
+                    _c2.checkbox("빼기", key=_xk, help="이 항목을 그림에서 아예 없앱니다")
+
+            st.markdown("---")
+            st.markdown("#### ③ 구조도 만들기")
+            _vals = {f["key"]: st.session_state.get(f"dv_{_no}_{f['key']}", "")
+                     for f in _d["fields"]}
+            _rm = {f["key"] for f in _d["fields"]
+                   if st.session_state.get(f"dx_{_no}_{f['key']}")}
+
+            _g1, _g2 = st.columns(2)
+            if _g1.button("이대로 쓰기", type="primary", use_container_width=True,
+                          help="지금 채운 내용으로 구조도를 확정합니다. "
+                               "4단계에서 원하는 자리에 놓을 수 있습니다."):
+                with st.spinner("구조도를 만드는 중… (10초쯤 걸립니다)"):
+                    try:
+                        _p = tempfile.NamedTemporaryFile(suffix=".pptx",
+                                                         delete=False).name
+                        _diag_build(_no, _vals, _p, removed=_rm)
+                        st.session_state["diag_pptx"] = _p
+                        _img, _err = pptx_slide_png(_p, 1)
+                        st.session_state["diag_img"] = _img
+                        st.session_state["diag_err"] = _err
+                    except Exception as e:
+                        st.session_state["diag_err"] = str(e)
+                st.rerun()
+
+            if st.session_state.get("diag_pptx"):
+                with open(st.session_state["diag_pptx"], "rb") as _f:
+                    _g2.download_button(
+                        "PPT로 내려받아 직접 고치기", data=_f.read(),
+                        file_name=f"금융구조도_{_d['title']}.pptx",
+                        mime="application/vnd.openxmlformats-officedocument."
+                             "presentationml.presentation",
+                        use_container_width=True,
+                        help="파워포인트에서 자유롭게 고칠 수 있습니다. "
+                             "고친 뒤 아래에 다시 올려주세요.")
+            else:
+                _g2.button("PPT로 내려받아 직접 고치기", use_container_width=True,
+                           disabled=True,
+                           help="먼저 왼쪽 '이대로 쓰기' 를 눌러 구조도를 만들어 주세요.")
+
+            if st.session_state.get("diag_err"):
+                st.warning(f"그림 미리보기를 만들지 못했습니다 — "
+                           f"{st.session_state['diag_err']}")
+            if st.session_state.get("diag_img"):
+                st.markdown("##### 완성된 구조도")
+                st.image(st.session_state["diag_img"], use_container_width=True)
+
+            # ── ④ 직접 고친 것 올리기 ────────────────
+            with st.expander("직접 고친 구조도 올리기 (선택)"):
+                st.caption(
+                    "위에서 내려받은 PPT를 파워포인트에서 고쳤다면 여기에 올려주세요.\n\n"
+                    "· **PPT 파일** 로 올리면 그대로 요약본에 들어갑니다(권장 — 화질 손실 없음).\n"
+                    "· 이미지로 주고 싶다면, 파워포인트에서 구조도를 선택하고 "
+                    "**우클릭 → 그림으로 저장** 한 뒤 그 파일을 올리세요.")
+                _up2 = st.file_uploader("고친 구조도 (PPTX 또는 이미지)",
+                                        type=["pptx", "png", "jpg", "jpeg"],
+                                        key="diag_up")
+                if _up2 is not None:
+                    _suf = os.path.splitext(_up2.name)[1].lower()
+                    _t = tempfile.NamedTemporaryFile(suffix=_suf, delete=False)
+                    _t.write(_up2.getvalue())
+                    _t.close()
+                    if _suf == ".pptx":
+                        st.session_state["diag_pptx"] = _t.name
+                        _img, _err = pptx_slide_png(_t.name, 1)
+                        st.session_state["diag_img"] = _img
+                        st.session_state["diag_err"] = _err
+                        st.success("고친 PPT를 받았습니다. 이걸로 요약본에 넣습니다.")
+                    else:
+                        st.session_state["diag_png"] = _up2.getvalue()
+                        st.session_state["diag_img"] = _up2.getvalue()
+                        st.success("이미지를 받았습니다. 이걸로 요약본에 넣습니다.")
+
+        _ok = bool(st.session_state.get("diag_pptx")
+                   or st.session_state.get("diag_png"))
+        st.success("구조도 준비됨 — 4단계에서 「금융구조도」를 배치할 수 있습니다."
+                   if _ok else
+                   "아직 구조도를 만들지 않았습니다. 필요 없으면 그냥 넘어가세요.")
+
+    st.markdown("---")
+    _d1, _sp3, _d2 = st.columns([2, 4, 2])
+    if _d1.button("← 이전 단계", use_container_width=True):
+        _goto(2)
+    if _d2.button("다음 단계 →", type="primary", use_container_width=True,
+                  disabled=not data):
+        _goto(4)
+
+
+
+# ──────────────────────────────────────────────────
+# 3단계 — 내용
+# ──────────────────────────────────────────────────
+elif step == 4:
     st.markdown("### 3단계 · 내용 배치")
     st.caption("A4 한 장을 좌·우 두 단으로 나눴습니다. 각 칸에 **무엇을 넣을지** 고르면 "
                "원본에서 그 내용을 찾아 채웁니다.")
@@ -354,6 +601,9 @@ elif step == 3:
             "법인개요":     bool(data.get("법인개요")),
             "재무제표":     bool(data.get("재무제표")),
             "조감도":       bool(data.get("이미지_있음", True)),
+            # 3단계에서 만들었을 때만 뜬다(안 만들었으면 넣을 게 없다)
+            "금융구조도":   bool(st.session_state.get("diag_pptx")
+                                or st.session_state.get("diag_png")),
         }
         # ★목록은 '기본 7항목' 을 위에, 원본에서 찾은 그 밖의 내용을 그 아래에.
         _SEP = "──── 원본의 그 밖의 내용 ────"      # 고르면 (비움)으로 친다
@@ -490,15 +740,15 @@ elif step == 3:
     st.markdown("---")
     b1, _sp2, b2 = st.columns([2, 4, 2])
     if b1.button("← 이전 단계", use_container_width=True):
-        _goto(2)
+        _goto(3)
     if b2.button("다음 단계 →", type="primary", use_container_width=True, disabled=not data):
-        _goto(4)
+        _goto(5)
 
 
 # ──────────────────────────────────────────────────
-# 4단계 — 생성
+# 5단계 — 생성
 # ──────────────────────────────────────────────────
-elif step == 4:
+elif step == 5:
     st.markdown("### 4단계 · 생성")
     if not data:
         st.warning("먼저 1단계에서 원본을 올려주세요.")
@@ -528,6 +778,9 @@ elif step == 4:
                 side: [v for v in _s2.get(side, []) if v and v != "(비움)"]
                 for side in ("left", "right")
             }
+            # 3단계에서 만든 금융구조도 (PPT 가 있으면 PPT 우선 — 화질 손실 없음)
+            data["_diagram"] = {"pptx": st.session_state.get("diag_pptx"),
+                                "png": st.session_state.get("diag_png")}
             with st.spinner("요약본을 만드는 중..."):
                 try:
                     tf = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
@@ -572,4 +825,4 @@ elif step == 4:
     st.markdown("---")
     _p1, _p2, _p3 = st.columns([2, 4, 2])
     if _p1.button("← 이전 단계", use_container_width=True):
-        _goto(3)
+        _goto(4)

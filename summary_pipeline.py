@@ -418,8 +418,18 @@ def _stack(blocks, x_in, w_in, top_in, bottom_in, gap_in=0.16, label_gap_in=0.05
                 _fit_table_rows(body)         # 글 양에 맞춰 행 높이 확보
                 h = _table_h(body)
             else:
+                # 그림·구조도는 폭만 바꾸면 찌그러진다 → 높이도 같은 비율로.
+                _ow, _oh = body.width or 0, body.height or 0
+                _ratio = (W / _ow) if _ow > 0 else 1.0
                 body.width = W
-                h = body.height or 0
+                h = int(_oh * _ratio)
+                # ★그룹을 줄여도 안쪽 '표'는 안 줄어든다(OOXML 특성) → 직접 줄인다.
+                if getattr(body, "name", "") == "금융구조도":
+                    try:
+                        import diagram as _dgm
+                        _dgm.scale_tables_in_group(body, _ratio)
+                    except Exception as _se:
+                        print(f"[요약본] 구조도 표 축소 실패: {_se}")
             body.height = h
             y = y + h + Inches(gap_in)
     return y / 914400.0
@@ -742,6 +752,25 @@ def build_summary(data: dict, pdf_path: str, out_path: str, pages: int = 1,
 
     _FIXED_N = 6      # 틀에 원래 있는 표 6개(L, TR, F, C, B, SC)
 
+    # ── ★3단계에서 만든 금융구조도 넣기 ───────────────
+    #   PPT 로 만들었으면 도형째 옮긴다(웹 서버엔 파워포인트가 없어 그림으로 못 바꾼다).
+    #   이미지로 받았으면 그림으로 넣는다.
+    _diag = data.get("_diagram") or {}
+    _diag_shape = None
+    if _diag.get("pptx") and os.path.exists(_diag["pptx"]):
+        try:
+            import diagram as _dgm
+            _diag_shape = _dgm.insert_diagram(s3, _diag["pptx"])
+        except Exception as _de:
+            print(f"[요약본] 금융구조도(PPT) 넣기 실패: {_de}")
+    elif _diag.get("png"):
+        try:
+            _diag_shape = s3.shapes.add_picture(
+                io.BytesIO(_diag["png"]), Inches(0.25), Inches(0.39),
+                width=Inches(4.90))
+        except Exception as _de:
+            print(f"[요약본] 금융구조도(이미지) 넣기 실패: {_de}")
+
     def _blocks_of(slide):
         """그 슬라이드의 '항목명 → (라벨, 본문)' 지도.
            복제본도 표 순서·라벨 문구가 같으므로 똑같이 찾을 수 있다."""
@@ -758,6 +787,10 @@ def build_summary(data: dict, pdf_path: str, out_path: str, pages: int = 1,
             "법인개요":     (_find_label(slide, "법인개요"), C),
             "재무제표":     (_find_label(slide, "재무현황"), F),
             "조감도":       (None, pic),
+            # 복제된 2페이지에도 같은 이름의 그룹이 생기므로 이름으로 찾는다
+            # (s3 의 도형을 그대로 가리키면 2페이지에서 엉뚱한 걸 건드린다)
+            "금융구조도":   (None, next((sh for sh in slide.shapes
+                                        if sh.name == "금융구조도"), None)),
         }
         # 뒤에 붙인 '그 밖의 내용' 블록 — 만든 순서 = 표 순서.
         for _i, _k in enumerate(_extra_order):
