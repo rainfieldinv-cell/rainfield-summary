@@ -19,17 +19,41 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 LAYOUT = os.path.join(_HERE, "layout", "금융구조도_모음.pptx")
 THUMBS = os.path.join(_HERE, "layout", "구조도_썸네일")
 
-# 동그라미 숫자 ①~⑳ (그 뒤에 -1 같은 꼬리표가 붙을 수 있다)
-_CIRCLE = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+# 표식 문자 — 뒤에 '-1' 같은 꼬리표가 붙을 수 있다.
+#   ①②③ … : 상자(회사·금액 칸)
+#   ⓐⓑⓒ … : 화살표 라벨   ← 둘을 갈라 써야 번호가 서로 안 섞인다
+_CIRCLE = ("①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+           "ⓐⓑⓒⓓⓔⓕⓖⓗⓘⓙⓚⓛⓜⓝⓞⓟⓠⓡⓢⓣⓤⓥⓦⓧⓨⓩ"
+           "ⒶⒷⒸⒹⒺⒻⒼⒽⒾⒿⓀⓁⓂⓃⓄⓅⓆⓇⓈⓉⓊⓋⓌⓍⓎⓏ")
 _MARK_ONLY = re.compile(r"^\s*([" + _CIRCLE + r"])\s*(-\s*\d+)?\s*$")
 _MARK_HEAD = re.compile(r"^\s*([" + _CIRCLE + r"])\s*(-\s*\d+)?\s*")
 
 EMU_IN = 914400.0
 
 
+_NUM = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+
+
 def _norm_mark(ch, tail):
     """'①' + '-1' → '①-1' (공백 제거)"""
     return ch + (tail.replace(" ", "") if tail else "")
+
+
+def _order_key(f):
+    """입력칸을 보여줄 순서 — ①②③ 먼저(번호순), 그다음 ⓐⓑⓒ(알파벳순).
+
+    번호가 없는 칸은 맨 뒤. '①-1' 은 '①' 바로 뒤에 온다.
+    """
+    mk = f.get("mark") or ""
+    if not mk:
+        return (9, 0, 0)
+    head, _, tail = mk.partition("-")
+    head = head.strip()
+    sub = int(tail) if tail.strip().isdigit() else 0
+    if head in _NUM:
+        return (0, _NUM.index(head), sub)
+    i = _CIRCLE.find(head)
+    return (1, i if i >= 0 else 999, sub)
 
 
 # ── 도형 훑기 ────────────────────────────────────────
@@ -169,14 +193,25 @@ def read_layouts(path: str = None):
         for i, f in enumerate(fields):
             f["key"] = f"{'box' if f['kind'] == '상자' else 'arw'}:{f['mark'] or i}"
 
+        # ★화면에 보여줄 순서 — 숫자(①②③)를 먼저, 그다음 알파벳(ⓐⓑⓒ).
+        #   각각 붙인 번호 순서대로. 번호가 없는 칸은 맨 뒤로 보낸다.
+        fields.sort(key=_order_key)
+
         out.append({"no": si, "title": title or f"{si}번 구조도", "fields": fields})
     return out
 
 
 def thumb_path(no: int):
-    """그 구조도의 미리보기 사진 경로(없으면 None)."""
-    p = os.path.join(THUMBS, f"{no:02d}.png")
-    return p if os.path.exists(p) else None
+    """그 구조도의 미리보기 사진 경로(없으면 None).
+
+    파일 이름은 '3.png' 도 되고 '03.png' 도 된다(직접 저장한 것과 자동으로
+    뽑은 것의 이름이 달라 못 찾던 적이 있다).
+    """
+    for name in (f"{no}.png", f"{no:02d}.png", f"{no}.jpg", f"{no:02d}.jpg"):
+        p = os.path.join(THUMBS, name)
+        if os.path.exists(p):
+            return p
+    return None
 
 
 # ── 만든 구조도를 요약본에 끼워 넣기 ──────────────────
