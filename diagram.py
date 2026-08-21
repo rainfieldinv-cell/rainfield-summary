@@ -205,7 +205,9 @@ def insert_diagram(dst_slide, pptx_path: str, logo_below_in: float = 0.95):
             w, h = sh.width or 0, sh.height or 0
         except Exception:
             continue
-        if w <= 0 or h <= 0:
+        # ★가로 화살표는 높이가 0, 세로 화살표는 폭이 0 이다.
+        #   'w<=0 or h<=0' 로 거르면 **화살표가 통째로 사라진다**(실제로 그랬음).
+        if w <= 0 and h <= 0:
             continue
         if t < Emu(int(logo_below_in * EMU_IN)):
             continue                            # 로고·구조도 제목은 뺀다
